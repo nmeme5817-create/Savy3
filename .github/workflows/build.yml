@@ -1,0 +1,1073 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.7'
+
+      - name: SDK
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+            "platforms;android-35" "build-tools;35.0.0" || true
+
+      - name: Write project
+        run: |
+          D=app/src/main/java/live/savvy3
+          mkdir -p $D app/src/main/res/xml app/src/main/res/values app/src/main/assets
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "Savvy3"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "live.savvy3"
+              compileSdk = 35
+              defaultConfig {
+                  applicationId = "live.savvy3"
+                  minSdk = 30
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "3.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("com.google.mlkit:text-recognition:16.0.0")
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <application android:allowBackup="true" android:label="@string/app_name"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".CaptureService" android:exported="false"
+                      android:foregroundServiceType="mediaProjection" />
+                  <service android:name=".A11y" android:exported="true"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data android:name="android.accessibilityservice"
+                          android:resource="@xml/a11y" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="app_name">Savvy 3</string>
+              <string name="a11y_desc">Reads the Savvy board and taps the keyboard.</string>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/xml/a11y.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagRetrieveInteractiveWindows"
+              android:canRetrieveWindowContent="true"
+              android:canPerformGestures="true"
+              android:notificationTimeout="100"
+              android:description="@string/a11y_desc" />
+          EOF
+
+          cat > $D/Solver.kt <<'EOF'
+          package live.savvy3
+
+          class Solver(private val dict: List<String>) {
+              data class Row(val letters: String, val marks: String)
+              data class Out(val pool: Int, val ranked: List<String>)
+              private class C(val g: Array<Char?>, val y: Set<String>, val lo: Map<Char, Int>, val hi: Map<Char, Int>)
+
+              fun solve(rows: List<Row>, n: Int, mode: Int): Out {
+                  val c = cons(rows, n)
+                  val used = HashSet<Char>()
+                  for (r in rows) for (ch in r.letters) used.add(ch)
+                  val pool = ArrayList<String>()
+                  for (w in dict) if (w.length == n && fits(w, c)) pool.add(w)
+                  if (pool.isEmpty()) return Out(0, emptyList())
+                  return Out(pool.size, rank(pool, used, n, mode))
+              }
+
+              private fun cons(rows: List<Row>, n: Int): C {
+                  val g = arrayOfNulls<Char>(n)
+                  val y = HashSet<String>()
+                  val lo = HashMap<Char, Int>()
+                  val hi = HashMap<Char, Int>()
+                  for (r in rows) {
+                      if (r.letters.length != n || r.marks.length != n) continue
+                      val ng = HashMap<Char, Int>()
+                      for (i in 0 until n) if (r.marks[i] != 'x') {
+                          val ch = r.letters[i]
+                          ng[ch] = (ng[ch] ?: 0) + 1
+                      }
+                      for (i in 0 until n) {
+                          val ch = r.letters[i]
+                          if (r.marks[i] == 'g') { g[i] = ch; lo[ch] = 1 }
+                          if (r.marks[i] == 'y') { y.add(ch.toString() + i); lo[ch] = 1 }
+                      }
+                      for (i in 0 until n) if (r.marks[i] == 'x') {
+                          val ch = r.letters[i]
+                          hi[ch] = minOf(hi[ch] ?: 99, ng[ch] ?: 0)
+                      }
+                  }
+                  for (e in lo.entries) {
+                      val h = hi[e.key] ?: continue
+                      if (h < e.value) hi[e.key] = e.value
+                  }
+                  return C(g, y, lo, hi)
+              }
+
+              private fun fits(w: String, c: C): Boolean {
+                  for (i in w.indices) {
+                      val g = c.g[i]
+                      if (g != null && w[i] != g) return false
+                  }
+                  for (k in c.y) {
+                      val pos = k[k.length - 1] - '0'
+                      if (w[pos] == k[0]) return false
+                  }
+                  val cnt = HashMap<Char, Int>()
+                  for (ch in w) cnt[ch] = (cnt[ch] ?: 0) + 1
+                  for (e in c.lo.entries) if ((cnt[e.key] ?: 0) < e.value) return false
+                  for (e in c.hi.entries) if ((cnt[e.key] ?: 0) > e.value) return false
+                  return true
+              }
+
+              private fun rank(pool: List<String>, used: Set<Char>, n: Int, mode: Int): List<String> {
+                  val pf = Array(n) { HashMap<Char, Int>() }
+                  val lf = HashMap<Char, Int>()
+                  for (w in pool) for (i in 0 until n) {
+                      val ch = w[i]
+                      pf[i][ch] = (pf[i][ch] ?: 0) + 1
+                      lf[ch] = (lf[ch] ?: 0) + 1
+                  }
+                  val tot = pool.size.toFloat()
+                  val wg = if (mode == 1) 0.55f else 1.0f
+                  val wn = if (mode == 1) 1.0f else 0.42f
+                  val score = HashMap<String, Float>()
+                  for (w in pool) {
+                      var s = 0f
+                      for (i in 0 until n) s += wg * ((pf[i][w[i]] ?: 0) / tot)
+                      val seen = HashSet<Char>()
+                      for (ch in w) {
+                          if (!seen.add(ch)) continue
+                          if (!used.contains(ch)) s += wn * ((lf[ch] ?: 0) / tot)
+                      }
+                      score[w] = s
+                  }
+                  return pool.sortedByDescending { score[it] ?: 0f }
+              }
+          }
+          EOF
+
+          cat > $D/Words.kt <<'EOF'
+          package live.savvy3
+
+          import android.content.Context
+
+          object Words {
+              private const val F =
+                  "crane slate audio raise arise irate stare trace cater react later alert alter scale tales " +
+                  "stale least steal lease adept adopt trade tread bares bears saber baser beard bread break " +
+                  "brace braid brain brake brand brass brave cabin cable cache cadet cagey camel cameo canal " +
+                  "candy canoe caper carat cards cared cargo carol carry carve cased cases caste catch cause " +
+                  "caved caves cease cedar cello chafe chain chair chalk champ chant chaos charm chart chase " +
+                  "chasm cheap cheat check cheek cheer chess chest chick chief child chime china chirp chock " +
+                  "choir choke chord chore chose chuck chunk churn chute cider cigar cinch civic civil claim " +
+                  "clamp clang clank clash clasp class clean clear cleat clerk click cliff climb cling clink " +
+                  "cloak clock clone close cloth cloud clout clove clown cluck clump coach coast cobra cocoa " +
+                  "colon color comet comfy comic comma conch condo coral corny couch cough could count coupe " +
+                  "court cover covet cower crack craft cramp crank crash crass crate crave crawl craze crazy " +
+                  "creak cream credo creed creek creep crepe crept crest cried crier crime crimp crisp croak " +
+                  "crock crone crony crook cross crowd crown crude cruel crumb crush crust crypt cubed cubes " +
+                  "cubic cumin curbs curds cured curio curly curry curse curve curvy cycle dairy daisy dance " +
+                  "dandy dared dares darts dated dates datum dealt deans dears death debit debug debut decal " +
+                  "decay decor decoy defer deign deity delay delta delve demon denim dense depot depth derby " +
+                  "desks deter detox devil diary dicey digit dimly diner dingy dirge dirty disco ditch diver " +
+                  "dizzy docks dodge dodgy doing dolly donor donut doubt dough dowdy dowel downs dowry dozen " +
+                  "draft drain drake drama drank drape drawl drawn dread dream dregs dress dried drier drift " +
+                  "drill drink drive droll drone drool droop drops dross drove drown druid drunk dryer dryly " +
+                  "ducky dummy dumpy dunce dunes dusky dusty dutch duvet dwarf dwell dwelt dying eager eagle " +
+                  "early earth easel eaten eater ebony eclat edict eerie eight eject elate elbow elder elect " +
+                  "elegy elfin elide elite elope elude email embed ember emcee empty enact ended endow enemy " +
+                  "enjoy ennui ensue enter entry envoy epoch epoxy equal equip erase erect erode error erupt " +
+                  "essay ester ether ethic ethos evade event every evict evoke exact exalt excel exert exile " +
+                  "exist expel extol extra exult fable faced facet faint fairy faith false famed fancy fangs " +
+                  "farce fatal fated fault fauna favor feast feats fecal feign fella felon femur fence feral " +
+                  "ferry fetal fetch fetid fever fewer fiber field fiend fiery fifth fifty fight filch filed " +
+                  "filet filly filmy filth final finch finer first fishy fists fixed fixer fizzy flail flair " +
+                  "flake flaky flame flank flare flash flask fleck fleet flesh flick flier fling flint flirt " +
+                  "float flock flood floor flora floss flour flout flown fluff fluid fluke flung flunk flush " +
+                  "flute foamy focal focus foggy foist folio folly foray force forge forgo forte forth forty " +
+                  "forum found foyer frail frame frank fraud freak freed freer fresh friar fried frill frisk " +
+                  "frock frond front frost froth frown froze fruit fudge fugue fully fungi funky funny furor " +
+                  "furry fussy fuzzy gable gaily gamut gassy gaudy gauge gaunt gauze gavel gawky gecko geeky " +
+                  "geese genie genre ghost ghoul giant giddy girth given giver glade gland glare glass glaze " +
+                  "gleam glean glide glint gloat globe gloom glory gloss glove glued gnome godly going golem " +
+                  "goofy goose gorge gouge gourd grace grade graft grail grain grand grant grape graph grasp " +
+                  "grass grate grave gravy graze great greed green greet grief grill grime grimy grind gripe " +
+                  "groan groin groom grope gross group grout grove growl grown gruel gruff grunt guard guava " +
+                  "guess guest guide guild guile guilt guise gulch gully gumbo gummy guppy gusto gusty habit " +
+                  "hairy halve handy hardy harem harpy harsh haste hasty hatch hater haunt haven havoc hazel " +
+                  "heady heard heart heath heave heavy hedge hefty heist hello hence herbs heron hertz hilly " +
+                  "hinge hippo hitch hoard hobby hoist holly homer honey honor horde horny horse hotel hound " +
+                  "house hover howdy human humid humor hunch hurry husky hutch hydro hyena hyper icily icing " +
+                  "ideal idiom idiot idler idyll igloo image imbue impel imply inane inbox incur index inept " +
+                  "inert infer ingot inlay inlet inner input inter intro irate irony islet issue itchy ivory " +
+                  "jaunt jazzy jelly jerky jetty jewel jiffy joint joist joker jolly joust judge juice juicy " +
+                  "jumbo jumpy junta juror karma kayak kebab khaki kinky kiosk kitty knack knave knead kneel " +
+                  "knelt knife knock knoll known koala label labor laden ladle lager lance lanky lapel lapse " +
+                  "large larva laser lasso latch later lathe latte laugh layer leach leafy leaky leant leaps " +
+                  "learn lease leash least leave ledge leech leery lefty legal legit lemon lemur level lever " +
+                  "libel light liken lilac limbo limit linen liner lingo lipid liter lithe liver livid llama " +
+                  "loamy loath lobby local locus lodge lofty logic loner loopy loose lorry loser louse lousy " +
+                  "lover lower lowly loyal lucid lucky lumpy lunar lunch lunge lurch lurid lusty lying lymph " +
+                  "lyric macaw macho macro madam madly mafia magic magma maize major maker mambo mamma mango " +
+                  "mangy mania manic manly manor maple march marry marsh mason match mauve maxim maybe mayor " +
+                  "mealy meaty medal media medic melon mercy merge merit merry metal meter metro micro midge " +
+                  "midst might milky mimic mince miner minor minty minus mirth misty mixed mixer modal model " +
+                  "modem mogul moist molar moldy money month moody moose moral moron morph mossy motel motif " +
+                  "motor motto mound mount mourn mouse mouth mover movie mower mucky mucus muddy mulch mummy " +
+                  "munch mural murky mushy music musky musty muted myrrh nadir naive nanny nasal nasty naval " +
+                  "navel needy neigh nerdy nerve never newer newly newsy nicer niche niece night ninja ninth " +
+                  "noble nobly noise noisy nomad north nosey notch noted novel nudge nurse nutty nylon nymph " +
+                  "oaken oasis obese occur ocean octal octet odder oddly offal offer often oiled olden older " +
+                  "olive omega onion onset opera opine opium optic orbit order organ other otter ought ounce " +
+                  "outdo outer outgo ovary overt ovine ovoid owing owner oxide ozone paddy pagan paint paler " +
+                  "palsy panel panic pansy papal paper parer parka parry parse party pasta paste pasty patch " +
+                  "patio patsy patty pause paved paver payee payer pearl pecan pedal penny perch peril perky " +
+                  "pesky pesto petal petty phase phone photo piano picky piece piety piggy pilot pinch piney " +
+                  "pinky pinto piper pique pitch pithy pivot pixel pixie pizza place plaid plain plait plane " +
+                  "plank plant plate plaza plead pleat plied plier pluck plumb plume plump plunk plush poems " +
+                  "point poise poker polar polka polyp pooch poppy porch poser posit pouch pound pouty power " +
+                  "prank prawn preen press price prick pride pried prime primo print prior prism privy prize " +
+                  "probe prone prong proof props prose proud prove prowl proxy prude prune psalm pubic pudgy " +
+                  "puffy pulpy pulse punch pupil puppy puree purer purge purse pushy putty pygmy quack quail " +
+                  "quake qualm quark quart quash quasi queen queer quell query quest queue quick quiet quill " +
+                  "quilt quirk quite quota quoth rabbi rabid racer radar radio rafts rainy raise rally ramen " +
+                  "ranch randy range rapid raspy ratio ratty raven rayon reach react ready realm rearm rebar " +
+                  "rebel rebus rebut recap recur recut reedy refer refit regal reign relax relay relic remit " +
+                  "renal renew repay repel reply rerun reset resin retch retro retry reuse revel revue rhino " +
+                  "rhyme rider ridge rifle right rigid rigor rinse ripen risen riser risky rival river rivet " +
+                  "roach roast robin robot rocky rodeo rogue roomy roost rotor rouge rough round rouse route " +
+                  "rover rowdy royal ruddy ruder rugby ruler rumba rumor rupee rural rusty saber sabre sadly " +
+                  "safer saint salad sally salon salsa salty salve salvo sandy saner sappy sassy satin satyr " +
+                  "sauce saucy sauna saute savor savvy scald scale scalp scaly scamp scant scare scarf scary " +
+                  "scene scent scion scoff scold scone scoop scope score scorn scour scout scowl scram scrap " +
+                  "scree screw scrub scrum scuba sedan seedy segue seize semen sense sepia serum serve setup " +
+                  "seven sever sewer shack shade shady shaft shake shaky shale shall shame shank shape shard " +
+                  "share shark sharp shave shawl sheaf shear sheen sheep sheer sheet sheik shelf shell shied " +
+                  "shift shine shiny shire shirk shirt shoal shock shone shook shoot shore shorn short shout " +
+                  "shove shown showy shrew shrub shrug shuck shunt shush shyly siege sieve sight sigma silky " +
+                  "silly since sinew singe siren sissy sixth sixty skate skier skiff skill skimp skirt skulk " +
+                  "skull skunk slack slain slang slant slash slate sleek sleep sleet slept slice slick slide " +
+                  "slime slimy sling slink slope slosh sloth slump slung slunk slurp slush slyly smack small " +
+                  "smart smash smear smell smelt smile smirk smite smock smoke smoky smote snack snail snake " +
+                  "snaky snare snarl sneak snide sniff snipe snoop snore snort snout snowy snuck snuff soapy " +
+                  "sober soggy solar solid solve sonar sonic sooth sooty sorry sound south sower space spade " +
+                  "spank spare spark spasm spawn speak spear speck speed spell spend spent sperm spice spicy " +
+                  "spied spiel spike spiky spill spilt spine spiny spire spite splat split spoil spoke spoof " +
+                  "spook spool spoon spore sport spout spray spree sprig spurn spurt squad squat squib stack " +
+                  "staff stage staid stain stair stake stale stalk stall stamp stand stank stare stark start " +
+                  "stash state stave steak steal steam steed steel steep steer stein stern stick stiff still " +
+                  "stilt sting stink stint stock stoic stoke stole stomp stone stony stood stool stoop store " +
+                  "stork storm story stout stove strap straw stray strip strut stuck study stuff stump stung " +
+                  "stunk stunt style suave sugar suing suite sulky sully sumac sunny super surer surge surly " +
+                  "sushi swamp swarm swear sweat sweep sweet swell swept swift swine swing swipe swirl swish " +
+                  "swoon swoop sword swore sworn swung synod syrup table taboo tacit tacky taffy taint taken " +
+                  "taker tally talon tamer tango tangy taper tapir tardy tarot taste tasty taunt tawny teach " +
+                  "tease teddy teeth tempo tenet tenor tense tenth tepid terse testy thank theft their theme " +
+                  "there these thick thief thigh thing think third thong thorn those three threw throb throw " +
+                  "thumb thump thyme tiara tibia tidal tiger tight timer timid tipsy titan tithe title toast " +
+                  "today token tonal tonic tooth topaz topic torch torso total totem touch tough towel tower " +
+                  "toxic toxin trace track tract trade trail train trait tramp trash tread treat trend triad " +
+                  "trial tribe trick tried tripe trite troll troop trope trout truce truck truly trump trunk " +
+                  "truss trust truth tryst tulip tumor tunic turbo tutor twang tweak tweed tweet twice twine " +
+                  "twirl twist udder ulcer ultra umbra uncle uncut under undue unfit unify union unite unity " +
+                  "unlit until unzip upper upset urban urine usage usher using usual usurp utter vague valet " +
+                  "valid valor value valve vapid vapor vault vaunt vegan venom venue verge verse verso verve " +
+                  "vicar video vigil vigor villa vinyl viola viper viral virus visit visor vista vital vivid " +
+                  "vixen vocal vodka vogue voice vomit voter vouch vowel vying wacky wafer wager wagon waist " +
+                  "waive waltz warty waste watch water waver weary weave wedge weedy weigh weird welsh wench " +
+                  "whack whale wharf wheat wheel whelp where which whiff while whine whiny whirl whisk white " +
+                  "whole whoop whose widen wider widow width wield wilds willy wimpy wince winch windy wiser " +
+                  "wispy witch witty woken woman women woody woozy wordy world worry worse worst worth would " +
+                  "wound woven wrack wrath wreak wreck wrest wring wrist write wrong wrote wrung yacht yearn " +
+                  "yeast yield young yours youth zebra zesty"
+
+              fun load(c: Context): List<String> {
+                  val a = runCatching {
+                      c.assets.open("words5.txt").bufferedReader().use { r ->
+                          r.readLines().map { it.trim().lowercase() }
+                              .filter { it.length == 5 && it.all { ch -> ch in 'a'..'z' } }
+                      }
+                  }.getOrNull()
+                  if (!a.isNullOrEmpty()) return a
+                  return F.split(" ").filter { it.length == 5 }
+              }
+          }
+          EOF
+
+          cat > $D/Grid.kt <<'EOF'
+          package live.savvy3
+
+          import android.graphics.Rect
+
+          object Grid {
+              data class Cell(val ch: Char, val box: Rect)
+
+              fun best(cells: List<Cell>): Pair<Int, List<List<Cell>>>? {
+                  val bands = cells.groupBy { it.box.centerY() / 45 }
+                  val rows = ArrayList<List<Cell>>()
+                  for (b in bands.values) {
+                      val r = b.sortedBy { it.box.centerX() }
+                      if (r.size in 4..7) rows.add(r)
+                  }
+                  if (rows.isEmpty()) return null
+                  var n = 0
+                  var most = 0
+                  for (r in rows) {
+                      val c = rows.count { it.size == r.size }
+                      if (c > most) { most = c; n = r.size }
+                  }
+                  val keep = rows.filter { it.size == n }
+                  if (keep.isEmpty()) return null
+                  val widths = ArrayList<Int>()
+                  for (r in keep) for (c in r) widths.add(c.box.width())
+                  widths.sort()
+                  val med = widths[widths.size / 2]
+                  val ok = ArrayList<List<Cell>>()
+                  for (r in keep) {
+                      var good = true
+                      for (c in r) if (c.box.width() < (med * 0.5f).toInt() || c.box.width() > (med * 1.8f).toInt()) good = false
+                      if (good) ok.add(r)
+                  }
+                  if (ok.isEmpty()) return null
+                  return Pair(n, ok)
+              }
+          }
+          EOF
+
+          cat > $D/Tiles.kt <<'EOF'
+          package live.savvy3
+
+          import android.graphics.Bitmap
+          import android.graphics.Color
+
+          object Tiles {
+              private fun hsv(b: Bitmap, x0: Int, y0: Int): FloatArray {
+                  var r = 0L
+                  var g = 0L
+                  var bl = 0L
+                  var n = 0
+                  for (dx in -9..9) for (dy in -9..9) {
+                      val x = (x0 + dx).coerceIn(0, b.width - 1)
+                      val y = (y0 + dy).coerceIn(0, b.height - 1)
+                      val p = b.getPixel(x, y)
+                      r += Color.red(p)
+                      g += Color.green(p)
+                      bl += Color.blue(p)
+                      n++
+                  }
+                  val out = FloatArray(3)
+                  if (n == 0) return out
+                  Color.RGBToHSV((r / n).toInt(), (g / n).toInt(), (bl / n).toInt(), out)
+                  return out
+              }
+
+              fun marks(b: Bitmap, row: List<Grid.Cell>, mult: Float): String {
+                  val s = ArrayList<FloatArray>()
+                  for (c in row) s.add(hsv(b, c.box.centerX(), c.box.centerY()))
+                  val sats = ArrayList<Float>()
+                  for (v in s) if (v[2] > 0.09f / mult) sats.add(v[1])
+                  if (sats.isEmpty()) return "?".repeat(row.size)
+                  sats.sort()
+                  val med = sats[sats.size / 2]
+                  val sb = StringBuilder()
+                  for (v in s) {
+                      if (v[2] <= 0.09f / mult) sb.append('?')
+                      else if (v[1] < 0.18f * mult || v[1] < med * 0.6f) sb.append('x')
+                      else if (v[0] < 78f) sb.append('y')
+                      else sb.append('g')
+                  }
+                  return sb.toString()
+              }
+          }
+          EOF
+
+          cat > $D/Ocr.kt <<'EOF'
+          package live.savvy3
+
+          import android.graphics.Bitmap
+          import android.graphics.Rect
+          import com.google.mlkit.vision.common.InputImage
+          import com.google.mlkit.vision.text.TextRecognition
+          import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+
+          object Ocr {
+              private var rec: com.google.mlkit.vision.text.TextRecognizer? = null
+
+              private fun get(): com.google.mlkit.vision.text.TextRecognizer {
+                  var r = rec
+                  if (r == null) {
+                      r = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+                      rec = r
+                  }
+                  return r
+              }
+
+              fun scan(b: Bitmap, done: (List<Grid.Cell>) -> Unit) {
+                  val top = (b.height * 0.18f).toInt()
+                  val bot = (b.height * 0.82f).toInt()
+                  val crop = Bitmap.createBitmap(b, 0, top, b.width, bot - top)
+
+                  get().process(InputImage.fromBitmap(crop, 0))
+                      .addOnSuccessListener { t ->
+                          val out = ArrayList<Grid.Cell>()
+                          for (bl in t.textBlocks) for (ln in bl.lines) for (e in ln.elements) {
+                              val s = e.text.trim()
+                              if (s.isEmpty() || !s.all { it.isLetter() }) continue
+                              val bb = e.boundingBox ?: continue
+                              if (bb.height() < 14 || bb.height() > 140) continue
+                              if (s.length == 1) {
+                                  if (bb.width() >= 8 && bb.width() <= 140)
+                                      out.add(Grid.Cell(s[0].lowercaseChar(),
+                                          Rect(bb.left, bb.top + top, bb.right, bb.bottom + top)))
+                              } else {
+                                  val w = bb.width() / s.length
+                                  if (w >= 8 && w <= 140) for (i in s.indices)
+                                      out.add(Grid.Cell(s[i].lowercaseChar(), Rect(
+                                          bb.left + i * w, bb.top + top,
+                                          bb.left + (i + 1) * w, bb.bottom + top)))
+                              }
+                          }
+                          done(out)
+                      }
+                      .addOnFailureListener { done(emptyList()) }
+              }
+          }
+          EOF
+
+          cat > $D/A11y.kt <<'EOF'
+          package live.savvy3
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.graphics.Path
+          import android.graphics.Rect
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+
+          class A11y : AccessibilityService() {
+
+              override fun onServiceConnected() { me = this }
+              override fun onDestroy() { me = null; super.onDestroy() }
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              private fun top(): AccessibilityNodeInfo? {
+                  val r = rootInActiveWindow ?: return null
+                  if (r.packageName == GAME) return r
+                  for (w in windows) if (w.root?.packageName == GAME) return w.root
+                  return null
+              }
+
+              fun letters(): List<Grid.Cell> {
+                  val r = top() ?: return emptyList()
+                  val o = ArrayList<Grid.Cell>()
+                  walk(r, o, 0)
+                  return o
+              }
+
+              private fun walk(n: AccessibilityNodeInfo?, o: MutableList<Grid.Cell>, d: Int) {
+                  if (n == null || d > 40) return
+                  val t = (n.text ?: n.contentDescription)?.toString()?.trim()
+                  if (t != null && t.length == 1 && t[0].isLetter()) {
+                      val b = Rect()
+                      n.getBoundsInScreen(b)
+                      if (b.width() > 12 && b.height() > 12) o.add(Grid.Cell(t[0].lowercaseChar(), b))
+                  }
+                  for (i in 0 until n.childCount) walk(n.getChild(i), o, d + 1)
+              }
+
+              fun tap(label: String): Boolean {
+                  val r = top() ?: return false
+                  val hit = find(r, label, 0) ?: return false
+                  var n: AccessibilityNodeInfo? = hit
+                  while (n != null) {
+                      if (n.isClickable) return n.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                      n = n.parent
+                  }
+                  val b = Rect()
+                  hit.getBoundsInScreen(b)
+                  return tapAt(b.centerX().toFloat(), b.centerY().toFloat())
+              }
+
+              private fun find(n: AccessibilityNodeInfo?, l: String, d: Int): AccessibilityNodeInfo? {
+                  if (n == null || d > 40) return null
+                  val t = (n.text ?: n.contentDescription)?.toString()?.trim()
+                  if (t != null && t.equals(l, true)) return n
+                  for (i in 0 until n.childCount) {
+                      val f = find(n.getChild(i), l, d + 1)
+                      if (f != null) return f
+                  }
+                  return null
+              }
+
+              fun tapAt(x: Float, y: Float): Boolean {
+                  val p = Path()
+                  p.moveTo(x, y)
+                  val g = GestureDescription.Builder()
+                      .addStroke(GestureDescription.StrokeDescription(p, 0, 40))
+                      .build()
+                  return dispatchGesture(g, null, null)
+              }
+
+              companion object {
+                  const val GAME = "live.playsavvy.savvy"
+                  var me: A11y? = null
+              }
+          }
+          EOF
+
+          cat > $D/Typer.kt <<'EOF'
+          package live.savvy3
+
+          import android.os.Handler
+          import android.os.Looper
+
+          object Typer {
+              private val h = Handler(Looper.getMainLooper())
+              private val GO = listOf("enter", "submit", "guess", "send", "done")
+
+              fun type(w: String, delay: Long, done: () -> Unit) {
+                  val s = A11y.me
+                  if (s == null) { done(); return }
+                  var i = 0
+                  val step = object : Runnable {
+                      override fun run() {
+                          if (i < w.length) {
+                              s.tap(w[i].toString())
+                              i++
+                              h.postDelayed(this, delay)
+                          } else {
+                              h.postDelayed({
+                                  for (g in GO) if (s.tap(g)) break
+                                  done()
+                              }, 120)
+                          }
+                      }
+                  }
+                  h.post(step)
+              }
+          }
+          EOF
+
+          cat > $D/Stats.kt <<'EOF'
+          package live.savvy3
+
+          import android.content.Context
+
+          object Stats {
+              fun text(c: Context): String {
+                  val p = c.getSharedPreferences("stats", 0)
+                  val r = p.getInt("rounds", 0)
+                  if (r == 0) return "No rounds logged yet"
+                  val w = p.getInt("wins", 0)
+                  val avg = p.getInt("total", 0).toFloat() / r
+                  return r.toString() + " rounds · " + w + " won · avg " + String.format("%.1f", avg)
+              }
+          }
+          EOF
+
+          cat > $D/CaptureService.kt <<'EOF'
+          package live.savvy3
+
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.Bitmap
+          import android.graphics.PixelFormat
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.ImageReader
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.view.Gravity
+          import android.view.WindowManager
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import androidx.core.app.NotificationCompat
+
+          class CaptureService : Service() {
+
+              private lateinit var wm: WindowManager
+              private var proj: MediaProjection? = null
+              private var vd: VirtualDisplay? = null
+              private var ir: ImageReader? = null
+              private var box: LinearLayout? = null
+              private var strip: LinearLayout? = null
+              private var line: TextView? = null
+              private var solver: Solver? = null
+
+              private val h = Handler(Looper.getMainLooper())
+              private var lastHash = 0
+              private var busy = false
+              private var scanning = false
+              private var running = false
+              private var collapsed = false
+
+              override fun onCreate() {
+                  super.onCreate()
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  solver = Solver(Words.load(this))
+              }
+
+              override fun onStartCommand(i: Intent?, f: Int, s: Int): Int {
+                  val action = i?.action
+                  if (action == OFF) { stopSelf(); return START_NOT_STICKY }
+                  if (action != ON) return START_STICKY
+
+                  note()
+                  val code = i.getIntExtra("code", 0)
+                  val data: Intent? = i.getParcelableExtra("data")
+                  if (data == null) return START_NOT_STICKY
+
+                  val m = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  proj = m.getMediaProjection(code, data)
+                  proj?.registerCallback(object : MediaProjection.Callback() {
+                      override fun onStop() { stopSelf() }
+                  }, h)
+
+                  val d = resources.displayMetrics
+                  ir = ImageReader.newInstance(d.widthPixels, d.heightPixels, PixelFormat.RGBA_8888, 2)
+                  vd = proj?.createVirtualDisplay("sp", d.widthPixels, d.heightPixels, d.densityDpi,
+                      DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, ir!!.surface, null, h)
+
+                  overlay()
+                  running = true
+                  h.post(loop)
+                  return START_STICKY
+              }
+
+              private fun note() {
+                  val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+                  nm.createNotificationChannel(
+                      NotificationChannel(CH, "Savvy 3", NotificationManager.IMPORTANCE_LOW))
+                  startForeground(1, NotificationCompat.Builder(this, CH)
+                      .setContentTitle("Savvy 3 running")
+                      .setSmallIcon(android.R.drawable.ic_menu_view)
+                      .setOngoing(true)
+                      .build())
+              }
+
+              private val loop = object : Runnable {
+                  override fun run() {
+                      if (!running) return
+                      try { step() } catch (t: Throwable) { say("error " + t.message) }
+                      h.postDelayed(this, 300)
+                  }
+              }
+
+              private fun grab(): Bitmap? {
+                  val img = ir?.acquireLatestImage() ?: return null
+                  return try {
+                      val p = img.planes[0]
+                      val b = Bitmap.createBitmap(
+                          p.rowStride / p.pixelStride, img.height, Bitmap.Config.ARGB_8888)
+                      b.copyPixelsFromBuffer(p.buffer)
+                      b
+                  } finally {
+                      img.close()
+                  }
+              }
+
+              private fun step() {
+                  if (busy || scanning) return
+                  val bmp = grab() ?: return say("no frames")
+
+                  val tree = A11y.me?.letters() ?: emptyList()
+                  if (tree.size >= 4 && Grid.best(tree) != null) { onCells(tree, bmp); return }
+
+                  scanning = true
+                  Ocr.scan(bmp) { cells ->
+                      scanning = false
+                      onCells(cells, bmp)
+                  }
+              }
+
+              private fun onCells(cells: List<Grid.Cell>, bmp: Bitmap) {
+                  val s = solver ?: return
+                  if (cells.isEmpty()) return say("no letters found")
+                  val g = Grid.best(cells) ?: return say(cells.size.toString() + " letters, no grid")
+                  val n = g.first
+                  val grid = g.second
+                  val mult = prefs().getFloat("tol", 1f)
+
+                  val rows = ArrayList<Solver.Row>()
+                  for (r in grid) {
+                      if (rows.size >= 6) break
+                      var letters = ""
+                      for (c in r) letters += c.ch.toString()
+                      val marks = Tiles.marks(bmp, r, mult)
+                      var known = 0
+                      for (ch in marks) if (ch == 'g' || ch == 'y' || ch == 'x') known++
+                      if (known >= n - 1) rows.add(Solver.Row(letters, marks))
+                  }
+                  if (rows.isEmpty()) return say("waiting for marks")
+
+                  val done = ArrayList<Solver.Row>()
+                  for (r in rows) for (ch in r.marks) if (ch != '?') { done.add(r); break }
+
+                  var hash = 7
+                  for (r in done) hash = hash * 31 + (r.letters + r.marks).hashCode()
+                  val out = s.solve(done, n, prefs().getInt("mode", 0))
+                  if (out.pool == 0) return say("no fit - check board")
+
+                  say(out.pool.toString() + " left")
+                  show(out.ranked.take(5))
+
+                  if (prefs().getBoolean("auto", false) && out.ranked.isNotEmpty()
+                      && hash != lastHash && done.size < 6) {
+                      lastHash = hash
+                      busy = true
+                      Typer.type(out.ranked[0], prefs().getLong("delay", 85L)) { busy = false }
+                  }
+              }
+
+              private fun overlay() {
+                  val b = LinearLayout(this)
+                  b.orientation = LinearLayout.VERTICAL
+                  b.setPadding(16, 10, 16, 12)
+                  b.setBackgroundColor(0xEE0D1117.toInt())
+
+                  val head = LinearLayout(this)
+                  head.orientation = LinearLayout.HORIZONTAL
+
+                  val toggle = TextView(this)
+                  toggle.text = "—"
+                  toggle.textSize = 15f
+                  toggle.setTextColor(0xFF8FA6BD.toInt())
+                  toggle.setPadding(0, 0, 16, 0)
+                  toggle.setOnClickListener {
+                      collapsed = !collapsed
+                      val st = strip
+                      if (st != null) st.visibility =
+                          if (collapsed) LinearLayout.GONE else LinearLayout.VISIBLE
+                  }
+                  head.addView(toggle)
+
+                  val t = TextView(this)
+                  t.textSize = 11f
+                  t.setTextColor(0xFF8FA6BD.toInt())
+                  line = t
+                  head.addView(t)
+
+                  val st = LinearLayout(this)
+                  st.orientation = LinearLayout.HORIZONTAL
+                  strip = st
+
+                  b.addView(head)
+                  b.addView(st)
+
+                  val p = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                      PixelFormat.TRANSLUCENT)
+                  p.gravity = Gravity.BOTTOM
+
+                  runCatching { wm.addView(b, p) }
+                  box = b
+              }
+
+              private fun show(ws: List<String>) {
+                  val s = strip ?: return
+                  s.removeAllViews()
+                  for (i in ws.indices) {
+                      val tv = TextView(this)
+                      tv.text = ws[i].uppercase()
+                      tv.textSize = if (i == 0) 21f else 15f
+                      tv.setTextColor(if (i == 0) 0xFFFFFFFF.toInt() else 0xFFCFE3FF.toInt())
+                      tv.setPadding(14, 7, 14, 7)
+                      val w = ws[i]
+                      tv.setOnClickListener {
+                          lastHash = 0
+                          busy = true
+                          Typer.type(w, prefs().getLong("delay", 85L)) { busy = false }
+                      }
+                      s.addView(tv)
+                  }
+              }
+
+              private fun say(t: String) {
+                  val l = line
+                  if (l != null) l.text = t
+              }
+
+              private fun prefs() = getSharedPreferences("bot", MODE_PRIVATE)
+
+              override fun onDestroy() {
+                  running = false
+                  h.removeCallbacksAndMessages(null)
+                  val b = box
+                  if (b != null) runCatching { wm.removeView(b) }
+                  vd?.release()
+                  ir?.close()
+                  proj?.stop()
+                  super.onDestroy()
+              }
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              companion object {
+                  const val CH = "sp"
+                  const val ON = "on"
+                  const val OFF = "off"
+              }
+          }
+          EOF
+
+          cat > $D/MainActivity.kt <<'EOF'
+          package live.savvy3
+
+          import android.content.Intent
+          import android.media.projection.MediaProjectionManager
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.InputType
+          import android.widget.Button
+          import android.widget.CheckBox
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.Switch
+          import android.widget.TextView
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AppCompatActivity
+
+          class MainActivity : AppCompatActivity() {
+
+              private lateinit var status: TextView
+              private lateinit var out: TextView
+
+              private val launch =
+                  registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+                      if (r.resultCode == RESULT_OK && r.data != null) {
+                          val i = Intent(this, CaptureService::class.java)
+                          i.action = CaptureService.ON
+                          i.putExtra("code", r.resultCode)
+                          i.putExtra("data", r.data)
+                          startForegroundService(i)
+                          status.text = "running - switch to Savvy"
+                      }
+                  }
+
+              override fun onCreate(s: Bundle?) {
+                  super.onCreate(s)
+                  val p = getSharedPreferences("bot", MODE_PRIVATE)
+
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(44, 56, 44, 44)
+
+                  val title = TextView(this)
+                  title.text = "Savvy 3"
+                  title.textSize = 26f
+                  root.addView(title)
+
+                  val sub = TextView(this)
+                  sub.text = "Grant both, then start. Strip appears over the game."
+                  sub.textSize = 13f
+                  sub.setPadding(0, 12, 0, 26)
+                  root.addView(sub)
+
+                  val a11y = Button(this)
+                  a11y.text = "1. Accessibility"
+                  a11y.setOnClickListener {
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  }
+                  root.addView(a11y)
+
+                  val ov = Button(this)
+                  ov.text = "2. Draw over apps"
+                  ov.setOnClickListener {
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                          Uri.parse("package:" + packageName)))
+                  }
+                  root.addView(ov)
+
+                  val auto = Switch(this)
+                  auto.text = "Auto-send"
+                  auto.isChecked = p.getBoolean("auto", false)
+                  auto.setPadding(0, 24, 0, 6)
+                  auto.setOnCheckedChangeListener { _, v -> p.edit().putBoolean("auto", v).apply() }
+                  root.addView(auto)
+
+                  val mode = CheckBox(this)
+                  mode.text = "Solve mode (finds word, fewer placements)"
+                  mode.isChecked = p.getInt("mode", 0) == 1
+                  mode.setOnCheckedChangeListener { _, v -> p.edit().putInt("mode", if (v) 1 else 0).apply() }
+                  root.addView(mode)
+
+                  val dl = TextView(this)
+                  dl.text = "Tap delay (ms)"
+                  dl.textSize = 12f
+                  dl.setPadding(0, 14, 0, 0)
+                  root.addView(dl)
+
+                  val delay = EditText(this)
+                  delay.inputType = InputType.TYPE_CLASS_NUMBER
+                  delay.setText(p.getLong("delay", 85L).toString())
+                  delay.addTextChangedListener(object : android.text.TextWatcher {
+                      override fun afterTextChanged(e: android.text.Editable?) {
+                          val v = e?.toString()?.toLongOrNull()
+                          if (v != null) p.edit().putLong("delay", v).apply()
+                      }
+                      override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                      override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                  })
+                  root.addView(delay)
+
+                  val start = Button(this)
+                  start.text = "Start"
+                  start.setPadding(0, 26, 0, 0)
+                  start.setOnClickListener {
+                      if (A11y.me == null) { status.text = "enable accessibility first"; return@setOnClickListener }
+                      if (!Settings.canDrawOverlays(this@MainActivity)) {
+                          status.text = "allow overlay first"
+                          return@setOnClickListener
+                      }
+                      val m = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                      launch.launch(m.createScreenCaptureIntent())
+                  }
+                  root.addView(start)
+
+                  val stop = Button(this)
+                  stop.text = "Stop"
+                  stop.setOnClickListener {
+                      val i = Intent(this, CaptureService::class.java)
+                      i.action = CaptureService.OFF
+                      startService(i)
+                      status.text = "stopped"
+                  }
+                  root.addView(stop)
+
+                  val mh = TextView(this)
+                  mh.text = "Manual board (e.g. crane gxyxx)"
+                  mh.textSize = 12f
+                  mh.setPadding(0, 30, 0, 4)
+                  root.addView(mh)
+
+                  val manual = EditText(this)
+                  manual.hint = "crane gxyxx"
+                  root.addView(manual)
+
+                  val go = Button(this)
+                  go.text = "Solve manually"
+                  go.setOnClickListener {
+                      val rows = ArrayList<Solver.Row>()
+                      for (t in manual.text.toString().trim().lowercase().split(" ")) {
+                          if (t.length < 4) continue
+                          val n = t.length / 2
+                          rows.add(Solver.Row(t.substring(0, n), t.substring(n)))
+                      }
+                      if (rows.isEmpty()) { out.text = "nothing to solve"; return@setOnClickListener }
+                      val n = rows[0].letters.length
+                      val r = Solver(Words.load(this@MainActivity)).solve(rows, n, p.getInt("mode", 0))
+                      out.text = if (r.pool == 0) "no fit" else r.ranked.take(8).joinToString("  ")
+                  }
+                  root.addView(go)
+
+                  out = TextView(this)
+                  out.textSize = 18f
+                  out.setPadding(0, 12, 0, 0)
+                  root.addView(out)
+
+                  val st = TextView(this)
+                  st.text = Stats.text(this)
+                  st.textSize = 12f
+                  st.setPadding(0, 26, 0, 0)
+                  root.addView(st)
+
+                  status = TextView(this)
+                  status.textSize = 13f
+                  status.setPadding(0, 14, 0, 0)
+                  root.addView(status)
+
+                  setContentView(root)
+              }
+          }
+          EOF
+
+          curl -sf https://cdn.jsdelivr.net/gh/tabatkins/wordle-list/words \
+            -o app/src/main/assets/words5.txt || true
+
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: savvy3-apk
+          path: app/build/outputs/apk/debug/*.apk
